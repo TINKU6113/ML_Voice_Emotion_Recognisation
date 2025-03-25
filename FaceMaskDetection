@@ -1,0 +1,148 @@
+
+!pip install torch torchvision numpy opencv-python matplotlib
+
+import os
+import cv2
+import time
+import torch
+import numpy as np
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import xml.etree.ElementTree as ET
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+
+from PIL import Image
+from torchvision.ops import nms
+from torch.utils.data import Dataset, DataLoader
+from torchvision.utils import make_grid, save_image
+from sklearn.model_selection import train_test_split
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# Load Dataset
+
+
+images_path = "/content/drive/MyDrive/face-mask-detection/images"
+annotations_path = "/content/drive/MyDrive/face-mask-detection/annotations"
+
+class FaceMaskDataset(Dataset):
+    def __init__(self, images_path, annotations_path):
+        self.images_path = images_path
+        self.annotations_path = annotations_path
+        self.images = os.listdir(images_path)
+
+    def __getitem__(self, idx):
+        image = transforms.ToTensor()(Image.open(os.path.join(self.images_path, self.images[idx])).convert("RGB"))
+        annotation_path = os.path.join(self.annotations_path, self.images[idx][:-3] + "xml")
+        tree = ET.parse(annotation_path)
+        root = tree.getroot()
+
+        bbox = [[int(box.find(f"bndbox/{i}").text) for i in ["xmin", "ymin", "xmax", "ymax"]] for box in root.iter("object")]
+        labels = [2 if box.find("name").text == "with_mask" else 1 for box in root.iter("object")]
+
+        bbox = torch.tensor(bbox, dtype=torch.float32)
+        labels = torch.tensor(labels, dtype=torch.int64)
+
+        target = {
+            "boxes": bbox,
+            "labels": labels,
+            "image_id": torch.tensor([idx]),
+            "area": (bbox[:, 2] - bbox[:, 0]) * (bbox[:, 3] - bbox[:, 1]),
+            "iscrowd": torch.zeros(len(bbox), dtype=torch.int64)
+        }
+        return image, target
+
+    def __len__(self):
+        return len(self.images)
+
+# Create Dataset and DataLoader
+def collate_fn(batch):
+    return tuple(zip(*batch))
+
+dataset = FaceMaskDataset(images_path, annotations_path)
+train_dataset, test_dataset = train_test_split(dataset, test_size=0.95, random_state=42)
+train_dataloader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=2, collate_fn=collate_fn)
+test_dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False, num_workers=2, collate_fn=collate_fn)
+
+# Load Faster R-CNN Model
+model = fasterrcnn_resnet50_fpn(weights=True)
+in_features = model.roi_heads.box_predictor.cls_score.in_features
+model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes=3)
+model = model.to(device)
+
+# Define Optimizer
+optimizer = optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.001, momentum=0.95, weight_decay=0.05)
+
+# Train Model
+epochs = 10
+losses = []
+
+for epoch in range(epochs):
+    curr_loss = 0.0
+    model.train()
+    start_time = time.time()
+
+    for images, targets in train_dataloader:
+        images = [image.to(device) for image in images]
+        targets = [{k: v.to(device) for k, v in target.items()} for target in targets]
+        optimizer.zero_grad()
+        outputs = model(images, targets)
+        loss = sum(loss for loss in outputs.values())
+        loss.backward()
+        optimizer.step()
+        curr_loss += loss.item()
+
+    end_time = time.time()
+    avg_loss = curr_loss / len(train_dataloader)
+    losses.append(avg_loss)
+    print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}, Time: {end_time - start_time:.2f}s")
+
+# Plot Loss Curve
+plt.figure(figsize=(8, 6))
+plt.title("Loss Curve")
+plt.plot(range(epochs), losses, marker="o")
+plt.show()
+
+# Prediction and Visualization
+def predict_and_draw_boxes(test_dataset, nm_threshold=0.5, score_threshold=0.7, show_text=False):
+    sample_idx = np.random.randint(len(test_dataset))
+    image, _ = test_dataset[sample_idx]
+
+    model.eval()
+    with torch.no_grad():
+        image = image.to(device)
+        predictions = model([image])
+
+    boxes, scores, labels = predictions[0]['boxes'], predictions[0]['scores'], predictions[0]['labels']
+    keep = nms(boxes, scores, nm_threshold)
+
+    boxes = boxes[keep].cpu().numpy()
+    scores = scores[keep].cpu().numpy()
+    labels = labels[keep].cpu().numpy()
+
+    mask = scores > score_threshold
+    boxes, scores, labels = boxes[mask], scores[mask], labels[mask]
+    classes = ["", "No Mask", "Masked"]
+    image = cv2.cvtColor(image.permute(1, 2, 0).cpu().numpy(), cv2.COLOR_RGB2BGR)
+    for box, label, score in zip(boxes, labels, scores):
+        color = (0, 255, 0) if label == 2 else (0, 0, 255)
+        box = [int(coord) for coord in box]
+        cv2.rectangle(image, (box[0], box[1]), (box[2], box[3]), color, 1)
+        text = f"{classes[label]} ({100 * score:.2f}%)"
+        if show_text:
+            cv2.putText(image, text, (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    plt.figure()
+    plt.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    plt.axis("off")
+    plt.show()
+
+# Run Prediction
+predict_and_draw_boxes(test_dataset, show_text=True)
