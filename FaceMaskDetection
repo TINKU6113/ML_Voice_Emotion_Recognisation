@@ -1,5 +1,5 @@
 
-!pip install torch torchvision numpy opencv-python matplotlib
+#!pip install torch torchvision numpy opencv-python matplotlib
 
 import os
 import cv2
